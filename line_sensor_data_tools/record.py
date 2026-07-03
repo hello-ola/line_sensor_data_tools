@@ -6,8 +6,9 @@ from pathlib import Path
 import time
 
 from line_sensor_data_tools.common import (
+    make_recording_metadata,
+    metadata_sensor_names,
     package_data_dir,
-    robot_sensor_names,
     status_to_json_sensors,
 )
 
@@ -31,7 +32,8 @@ def main() -> int:
 
     out_path = args.out or default_output_path()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sensor_names = robot_sensor_names()
+    metadata = make_recording_metadata()
+    sensor_names = metadata_sensor_names(metadata)
 
     from stretch4_body.robot.robot_client import RobotClient
 
@@ -50,6 +52,7 @@ def main() -> int:
 
     try:
         with out_path.open('w', encoding='utf-8') as f:
+            f.write(json.dumps(metadata, separators=(',', ':')) + '\n')
             while args.frames == 0 or count < args.frames:
                 frame_start_s = time.monotonic()
                 client.pull_status()

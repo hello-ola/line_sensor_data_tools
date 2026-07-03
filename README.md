@@ -16,7 +16,8 @@ source install/setup.bash
 ros2 run line_sensor_data_tools line_sensor_record
 ```
 
-This saves JSONL files in the package data directory.
+This saves JSONL files in the package data directory. The first line stores
+the line sensor metadata needed for offline replay.
 
 Optional:
 
@@ -35,7 +36,7 @@ ros2 run line_sensor_data_tools line_sensor_replay_filter --filter none
 Or pick a file:
 
 ```bash
-ros2 run line_sensor_data_tools line_sensor_replay_filter --file test.jsonl --filter space_time_patch
+ros2 run line_sensor_data_tools line_sensor_replay_filter --file test.jsonl --filter xy_cluster
 ```
 
 Published topics:
@@ -47,6 +48,8 @@ Published topics:
 /line_sensor_trial/baseline/small_drop_points
 /line_sensor_trial/trial/obstacle_points
 /line_sensor_trial/trial/small_drop_points
+/line_sensor_trial/trial/clusters
+/line_sensor_trial/trial/cluster_debug
 ```
 
 `raw_candidates` are projected/classified bins before the current bin-level gates.
@@ -55,9 +58,23 @@ Published topics:
 `LineSensorSource` output.
 
 `trial` uses shared calibration/projection/classification, then your selected
-trial filter. It does not use the baseline spatial/spray/temporal gates.
+trial filter.
+
+`xy_cluster` groups candidates by XY distance, then applies the existing
+run-level noise checks to each cluster: spray, point-noise, and valid-run.
+It then applies the same bin temporal confirmation as baseline. It does not
+use contiguous-bin grouping.
+
+`/line_sensor_trial/trial/clusters` shows each XY cluster as a marker with a
+label like `C3 keep n=8 c=4` or `C4 spray n=16 c=0`.
+
+`/line_sensor_trial/trial/cluster_debug` publishes JSON with each cluster id,
+class, reason, centroid, radius, confirmed count, and sensor/bin members.
 
 It does not run the rolling hazard map.
+
+Old range-only JSONL files are not replayable offline. Record again so the
+file includes its own line sensor geometry/config metadata.
 
 ## Add A Filter
 
@@ -77,7 +94,7 @@ Then add it:
 FILTERS = {
     'none': filter_none,
     'moving_average': filter_moving_average,
-    'space_time_patch': filter_space_time_patch,
+    'xy_cluster': filter_xy_cluster,
     'my_filter': filter_my_filter,
 }
 ```
