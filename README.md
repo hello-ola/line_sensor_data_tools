@@ -5,7 +5,7 @@ Small tools to record Stretch line sensor ranges and replay them for filter test
 ## Build
 
 ```bash
-cd ~/ament_ws
+cd <your_ros2_ws>
 colcon build --packages-select line_sensor_data_tools
 source install/setup.bash
 ```
@@ -16,12 +16,12 @@ source install/setup.bash
 ros2 run line_sensor_data_tools line_sensor_record
 ```
 
-This saves JSONL files in `line_sensor_data_tools/data/`.
+This saves JSONL files in the package data directory.
 
 Optional:
 
 ```bash
-ros2 run line_sensor_data_tools line_sensor_record --rate 30 --out ~/ament_ws/src/line_sensor_data_tools/data/test.jsonl
+ros2 run line_sensor_data_tools line_sensor_record --rate 30 --out test.jsonl
 ```
 
 Stop with `Ctrl+C`.
@@ -29,13 +29,13 @@ Stop with `Ctrl+C`.
 ## Replay
 
 ```bash
-ros2 run line_sensor_data_tools line_sensor_replay_filter --filter baseline
+ros2 run line_sensor_data_tools line_sensor_replay_filter --filter none
 ```
 
 Or pick a file:
 
 ```bash
-ros2 run line_sensor_data_tools line_sensor_replay_filter --file ~/ament_ws/src/line_sensor_data_tools/data/test.jsonl --filter moving_average
+ros2 run line_sensor_data_tools line_sensor_replay_filter --file test.jsonl --filter space_time_patch
 ```
 
 Published topics:
@@ -54,7 +54,8 @@ Published topics:
 `baseline` is the current `stretch4_under_base_hazard` bin-level
 `LineSensorSource` output.
 
-`trial` is your selected filter, then the same `LineSensorSource` output.
+`trial` uses shared calibration/projection/classification, then your selected
+trial filter. It does not use the baseline spatial/spray/temporal gates.
 
 It does not run the rolling hazard map.
 
@@ -65,17 +66,18 @@ Edit `line_sensor_data_tools/replay_filter.py`.
 Add a function:
 
 ```python
-def filter_my_filter(status, state):
-    return copy_status(status)
+def filter_my_filter(source, status, state):
+    candidates = _extract_candidates(source, status)
+    return _hits_from_candidates(candidates)
 ```
 
 Then add it:
 
 ```python
 FILTERS = {
-    'baseline': filter_baseline,
     'none': filter_none,
     'moving_average': filter_moving_average,
+    'space_time_patch': filter_space_time_patch,
     'my_filter': filter_my_filter,
 }
 ```

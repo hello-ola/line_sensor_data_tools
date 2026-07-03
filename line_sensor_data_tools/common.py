@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 from dataclasses import fields
 import io
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,21 +14,7 @@ from ament_index_python.packages import PackageNotFoundError, get_package_share_
 PACKAGE_NAME = 'line_sensor_data_tools'
 
 
-def prefer_stretch4_body_source() -> None:
-    """Use the source checkout on robots where the editable loader is fragile."""
-    source_dir = Path('/home/hello-robot/repos/stretch4_body')
-    if source_dir.exists() and str(source_dir) not in sys.path:
-        sys.path.insert(0, str(source_dir))
-    sys.meta_path = [
-        finder
-        for finder in sys.meta_path
-        if getattr(type(finder), '__module__', '') != '_hello_robot_stretch4_body_editable_loader'
-    ]
-
-
-prefer_stretch4_body_source()
-
-from stretch4_under_base_hazard.line_sensor_source import (  # noqa: E402
+from stretch4_under_base_hazard.line_sensor_source import (
     LineSensorConfig,
     LineSensorSource,
 )
@@ -41,9 +26,6 @@ class CalibrationParamsHolder:
 
 
 def package_data_dir() -> Path:
-    source_candidate = Path.home() / 'ament_ws' / 'src' / PACKAGE_NAME / 'data'
-    if source_candidate.exists():
-        return source_candidate
     source_data = Path(__file__).resolve().parents[1] / 'data'
     if source_data.exists():
         return source_data

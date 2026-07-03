@@ -14,28 +14,105 @@ from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
 
 from line_sensor_data_tools.common import copy_status, frame_to_status, latest_recording, make_line_source
-from stretch4_under_base_hazard.line_sensor_source import LineSensorHits
+from stretch4_under_base_hazard.line_sensor_source import (
+    BinClass,
+    LineSensorHits,
+    as_range_array,
+)
 from stretch4_under_base_hazard.pointcloud_io import numpy_to_pointcloud2
 
 
-FILTER_NAME = 'baseline'
+FILTER_NAME = 'none'
 FILTER_WINDOW = 5
+SPACE_TIME_FRAMES = 4
+SPACE_TIME_SPATIAL_RADIUS = 1
+SPACE_TIME_MIN_VALID = 4
+SPACE_TIME_VARIANCE_THRESHOLD = 0.0025
 
 
-FilterFn = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+Candidate = tuple[int, str, int, BinClass, np.ndarray]
+FilterFn = Callable[[Any, dict[str, Any], dict[str, Any]], LineSensorHits]
 
 
-def filter_none(status: dict[str, Any], _state: dict[str, Any]) -> dict[str, Any]:
-    return copy_status(status)
+def _stack_xy(points: list[np.ndarray]) -> np.ndarray:
+    if not points:
+        return np.zeros((0, 2), dtype=np.float64)
+    return np.vstack(points)
 
 
-def filter_baseline(status: dict[str, Any], _state: dict[str, Any]) -> dict[str, Any]:
-    # Baseline means no extra range filtering before the existing bin-level
-    # LineSensorSource logic from stretch4_under_base_hazard.
-    return copy_status(status)
+def _hits_from_candidates(candidates: list[Candidate]) -> LineSensorHits:
+    obstacle_pts = [pt[:2] for _sidx, _name, _bidx, cls, pt in candidates if cls == BinClass.OBSTACLE]
+    small_drop_pts = [pt[:2] for _sidx, _name, _bidx, cls, pt in candidates if cls == BinClass.SMALL_DROP]
+    return LineSensorHits(
+        obstacle_xy=_stack_xy(obstacle_pts),
+        small_drop_xy=_stack_xy(small_drop_pts),
+        raw_obstacle_xy=_stack_xy(obstacle_pts),
+        raw_small_drop_xy=_stack_xy(small_drop_pts),
+    )
 
 
-def filter_moving_average(status: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+def _calibrated_ranges_by_sensor(source: Any, status: dict[str, Any]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for sensor_name in source.sensor_names:
+        sensor_status = status.get(sensor_name, {})
+        if not isinstance(sensor_status, dict):
+            continue
+        ranges = as_range_array(sensor_status.get('ranges'))
+        if ranges.size == 0:
+            continue
+        if source.apply_tare is not None:
+            ranges = source.apply_tare(ranges, sensor_name)
+        out[sensor_name] = np.asarray(ranges, dtype=np.float64)
+    return out
+
+
+def _extract_candidates(
+    source: Any,
+    status: dict[str, Any],
+    ranges_by_sensor: dict[str, np.ndarray] | None = None,
+) -> list[Candidate]:
+    cfg = source.config
+    candidates: list[Candidate] = []
+
+    for sensor_idx, sensor_name in enumerate(source.sensor_names):
+        if ranges_by_sensor is None:
+            sensor_status = status.get(sensor_name, {})
+            if not isinstance(sensor_status, dict):
+                continue
+            ranges = as_range_array(sensor_status.get('ranges'))
+            if ranges.size == 0:
+                continue
+            if source.apply_tare is not None:
+                ranges = source.apply_tare(ranges, sensor_name)
+        else:
+            ranges = ranges_by_sensor.get(sensor_name, np.array([], dtype=np.float64))
+            if ranges.size == 0:
+                continue
+
+        projected = source._project_sensor_bins(sensor_idx, ranges)
+        for bin_idx in range(len(ranges)):
+            if (
+                not np.isfinite(ranges[bin_idx])
+                or ranges[bin_idx] <= 0.0
+                or ranges[bin_idx] >= cfg.max_range
+            ):
+                continue
+            pt = projected[bin_idx]
+            r2 = pt[0] * pt[0] + pt[1] * pt[1]
+            if r2 > cfg.line_sensor_radius_m * cfg.line_sensor_radius_m:
+                continue
+            cls = source._classify_bin(pt[2])
+            if cls in (BinClass.OBSTACLE, BinClass.SMALL_DROP):
+                candidates.append((sensor_idx, sensor_name, bin_idx, cls, pt))
+
+    return candidates
+
+
+def filter_none(source: Any, status: dict[str, Any], _state: dict[str, Any]) -> LineSensorHits:
+    return _hits_from_candidates(_extract_candidates(source, status))
+
+
+def filter_moving_average(source: Any, status: dict[str, Any], state: dict[str, Any]) -> LineSensorHits:
     out = copy_status(status)
     history = state.setdefault('history', {})
     for sensor_name, sensor_status in out.items():
@@ -45,13 +122,44 @@ def filter_moving_average(status: dict[str, Any], state: dict[str, Any]) -> dict
         if len(sensor_history) == 0:
             continue
         sensor_status['ranges'] = np.nanmean(np.vstack(sensor_history), axis=0).tolist()
-    return out
+    return _hits_from_candidates(_extract_candidates(source, out))
+
+
+def filter_space_time_patch(source: Any, status: dict[str, Any], state: dict[str, Any]) -> LineSensorHits:
+    ranges_by_sensor = _calibrated_ranges_by_sensor(source, status)
+    history = state.setdefault('calibrated_history', deque(maxlen=SPACE_TIME_FRAMES))
+    history.append(ranges_by_sensor)
+
+    kept: list[Candidate] = []
+    for candidate in _extract_candidates(source, status, ranges_by_sensor):
+        _sensor_idx, sensor_name, bin_idx, _cls, _pt = candidate
+        values: list[float] = []
+        for frame in history:
+            ranges = frame.get(sensor_name)
+            if ranges is None or ranges.size == 0:
+                continue
+            start = max(0, bin_idx - SPACE_TIME_SPATIAL_RADIUS)
+            stop = min(len(ranges), bin_idx + SPACE_TIME_SPATIAL_RADIUS + 1)
+            patch = ranges[start:stop]
+            valid = patch[
+                np.isfinite(patch)
+                & (patch > 0.0)
+                & (patch < source.config.max_range)
+            ]
+            values.extend(float(value) for value in valid)
+
+        if len(values) >= SPACE_TIME_MIN_VALID:
+            if float(np.var(np.asarray(values, dtype=np.float64))) > SPACE_TIME_VARIANCE_THRESHOLD:
+                continue
+        kept.append(candidate)
+
+    return _hits_from_candidates(kept)
 
 
 FILTERS: dict[str, FilterFn] = {
-    'baseline': filter_baseline,
     'none': filter_none,
     'moving_average': filter_moving_average,
+    'space_time_patch': filter_space_time_patch,
 }
 
 
@@ -150,10 +258,8 @@ def replay_once(
         previous_t = current_t
 
         raw_status = frame_to_status(frame)
-        trial_status = filter_fn(raw_status, filter_state)
-
         baseline_hits = baseline_source.process(raw_status)
-        trial_hits = trial_source.process(trial_status)
+        trial_hits = filter_fn(trial_source, raw_status, filter_state)
         node.publish_raw_candidates(baseline_hits)
         node.publish_baseline(baseline_hits)
         node.publish_trial(trial_hits)
@@ -182,10 +288,10 @@ def main() -> int:
     rclpy.init()
     node = ReplayPublisher(args.frame_id)
     print(f'Replaying {path}')
-    print(f'Filter: {args.filter}')
+    print(f'Trial filter: {args.filter}')
     print('raw_candidates: projected/classified candidate bins before LineSensorSource gates.')
     print('baseline: current stretch4_under_base_hazard LineSensorSource bin-level filtering.')
-    print('trial: selected filter, then the same LineSensorSource bin-level filtering.')
+    print('trial: shared calibration/projection/classification, then the selected trial filter.')
     print('Publishing /line_sensor_trial/raw_candidates/*, /baseline/*, and /trial/*')
 
     try:
